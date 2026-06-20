@@ -102,21 +102,28 @@ def build_markov():
 #   var_scale : extra spread of the scenario multiplier around 1.0
 #               (1.0 = use HYDRO_MULT as-is; >1 amplifies dry/wet swings)
 # ---------------------------------------------------------------------------
-# Sized so that, run optimally, the reservoirs draw DOWN over the horizon (initial
-# storage + inflow < what hydro would like to supply), creating genuine intertemporal
-# scarcity -> positive, time-varying water values that compete with thermal cost.
+# Plant sizing targets:
+#   * Normal scenario: inflow ~= max_turbine so storage is roughly stable.
+#   * Dry scenario (mult 0.55): reservoir depletes toward min_storage but does
+#     NOT hit zero -- operators always keep an environmental/safety buffer.
+#   * Wet scenario (mult 1.45): inflow exceeds turbine so reservoir fills; spill
+#     opens once it hits max_storage.
+#   * min_storage > 0 encodes the operational buffer (environmental flows, flood
+#     control, instrument range) -- a real constraint that also prevents the model
+#     from corner solutions at zero.
+#
+# Columns: name, role, max_stor, init_stor, min_stor, max_turb, base, var_scale
 PLANTS = [
-    # name, role,                            max_stor, init_stor, max_turb, base, var_scale
     ("H1", "big reservoir, low inflow (storage-dominated, high water value)",
-     200, 90, 30, 9, 1.0),
+     200, 90, 30, 18, 16, 1.0),
     ("H2", "medium reservoir, medium inflow (balanced)",
-     120, 50, 25, 18, 1.0),
+     120, 50, 15, 18, 22, 1.0),
     ("H3", "small reservoir, high inflow (run-of-river, spills, low water value)",
-     40,  15, 28, 24, 1.0),
+     40,  15,  5, 20, 28, 1.0),
     ("H4", "medium reservoir, highly variable inflow (most scenario-sensitive)",
-     150, 60, 25, 16, 2.0),
+     150, 60, 20, 18, 22, 2.0),
     ("H5", "small reservoir, low inflow (constrained peaker)",
-     60,  25, 15, 7, 1.0),
+     60,  25,  8, 10, 12, 1.0),
 ]
 
 
@@ -128,13 +135,13 @@ def scenario_mult(var_scale, s):
 def build():
     hydro = []
     inflows = {}
-    for name, role, max_stor, init_stor, max_turb, base, var_scale in PLANTS:
+    for name, role, max_stor, init_stor, min_stor, max_turb, base, var_scale in PLANTS:
         hydro.append({
             "name": name,
             "role": role,
             "max_storage_MWh": max_stor,
             "initial_storage_MWh": init_stor,
-            "min_storage_MWh": 0,
+            "min_storage_MWh": min_stor,
             "max_turbine_MWh_per_stage": max_turb,
             "production_factor_MWh_per_MWh": 1.0,  # inflow already in energy terms
             "downstream": None,                    # no cascade in v1 (field reserved)

@@ -81,6 +81,20 @@ def validate(d):
             _check(len(row) == S, f"{t['name']} stage {st}: {len(row)} scenarios, expected {S}")
             _check(all(c >= 0 for c in row), f"{t['name']} stage {st}: negative cost")
 
+    # Optional Markov block (used by the stagewise-dependent model).
+    if "markov" in u:
+        mk = u["markov"]
+        init = mk["initial_distribution"]
+        _check(len(init) == S, f"initial_distribution has {len(init)} entries, expected {S}")
+        _check(abs(sum(init) - 1.0) < 1e-6, f"initial_distribution sums to {sum(init)}, expected 1")
+        _check(all(p >= 0 for p in init), "negative initial_distribution probability")
+        P = mk["transition_matrix"]
+        _check(len(P) == S, f"transition_matrix has {len(P)} rows, expected {S}")
+        for i, row in enumerate(P):
+            _check(len(row) == S, f"transition row {i} has {len(row)} entries, expected {S}")
+            _check(abs(sum(row) - 1.0) < 1e-6, f"transition row {i} sums to {sum(row)}, expected 1")
+            _check(all(p >= 0 for p in row), f"transition row {i}: negative probability")
+
     return d
 
 

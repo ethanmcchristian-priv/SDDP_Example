@@ -41,7 +41,8 @@ SEASONALITY = [1.30, 1.25, 1.15, 1.00, 0.85, 0.70, 0.65, 0.75, 0.90, 1.05]
 STAGE_COST_FACTOR = [0.95, 0.97, 1.00, 1.03, 1.07, 1.10, 1.07, 1.00, 0.97, 0.95]
 
 VOLL = 1000          # $/MWh, value of lost load (unserved energy penalty)
-THERMAL_CAPACITY = 80    # MWh per stage
+THERMAL_CAPACITY = 120   # MWh per stage; sized so thermal (not blackouts) is the
+                         # marginal backstop, so water value tracks fuel cost
 THERMAL_COST_REF = 50    # $/MWh reference (actual cost varies by scenario/stage)
 
 
@@ -61,24 +62,61 @@ HYDRO_MULT = linspace(0.55, 1.45, SCENARIOS)
 COST_MULT = linspace(1.40, 0.70, SCENARIOS)
 
 # ---------------------------------------------------------------------------
+# Exogenous Markov chain over the 10 scenario-states, used ONLY by the
+# stagewise-DEPENDENT model. We do NOT estimate this from data -- we assume it
+# was found exogenously (simplification). It encodes hydrological PERSISTENCE:
+# a dry state tends to be followed by another dry state, so droughts cluster.
+# The stagewise-INDEPENDENT model ignores this and redraws from the marginal
+# scenario probabilities every stage.
+# ---------------------------------------------------------------------------
+PERSISTENCE_RHO = 0.6      # 0 = memoryless (uniform-ish), ->1 = very sticky
+INITIAL_STATE_CENTER = 5   # start near "near-normal-wet"
+
+
+def _persistence_row(center, n, rho):
+    """Unnormalized weights peaked at `center`, decaying like rho**distance."""
+    w = [rho ** abs(j - center) for j in range(n)]
+    tot = sum(w)
+    return [round(x / tot, 4) for x in w]
+
+
+def _renorm(row):
+    """Fix tiny rounding so the row sums to exactly 1.0 (adjust the max entry)."""
+    diff = round(1.0 - sum(row), 4)
+    k = row.index(max(row))
+    row = list(row)
+    row[k] = round(row[k] + diff, 4)
+    return row
+
+
+def build_markov():
+    transition = [_renorm(_persistence_row(i, SCENARIOS, PERSISTENCE_RHO))
+                  for i in range(SCENARIOS)]
+    initial = _renorm(_persistence_row(INITIAL_STATE_CENTER, SCENARIOS, PERSISTENCE_RHO))
+    return transition, initial
+
+# ---------------------------------------------------------------------------
 # The five hydro plants, each with a distinct "personality" so their water
 # values come out meaningfully different.
 #   base      : mean inflow (MWh/stage) before seasonality & scenario scaling
 #   var_scale : extra spread of the scenario multiplier around 1.0
 #               (1.0 = use HYDRO_MULT as-is; >1 amplifies dry/wet swings)
 # ---------------------------------------------------------------------------
+# Sized so that, run optimally, the reservoirs draw DOWN over the horizon (initial
+# storage + inflow < what hydro would like to supply), creating genuine intertemporal
+# scarcity -> positive, time-varying water values that compete with thermal cost.
 PLANTS = [
     # name, role,                            max_stor, init_stor, max_turb, base, var_scale
     ("H1", "big reservoir, low inflow (storage-dominated, high water value)",
-     400, 300, 50, 15, 1.0),
+     200, 90, 30, 9, 1.0),
     ("H2", "medium reservoir, medium inflow (balanced)",
-     200, 120, 40, 30, 1.0),
+     120, 50, 25, 18, 1.0),
     ("H3", "small reservoir, high inflow (run-of-river, spills, low water value)",
-     50,  25, 45, 45, 1.0),
+     40,  15, 28, 24, 1.0),
     ("H4", "medium reservoir, highly variable inflow (most scenario-sensitive)",
-     250, 150, 40, 28, 2.0),
+     150, 60, 25, 16, 2.0),
     ("H5", "small reservoir, low inflow (constrained peaker)",
-     80,  40, 30, 10, 1.0),
+     60,  25, 15, 7, 1.0),
 ]
 
 
@@ -163,6 +201,18 @@ def build():
             "inflows_MWh": inflows,
             "thermal_cost_per_MWh": {"T1": thermal_cost},
         },
+    }
+
+    transition, initial = build_markov()
+    data["uncertainty"]["markov"] = {
+        "note": ("Exogenous (assumed, NOT estimated) Markov chain over the 10 "
+                 "scenario-states. Used by the stagewise-DEPENDENT model only. "
+                 "Stage-independent transition matrix; encodes hydrological "
+                 "persistence so droughts cluster. transition_matrix[i][j] = "
+                 "P(next state = j | current state = i)."),
+        "persistence_rho": PERSISTENCE_RHO,
+        "initial_distribution": initial,
+        "transition_matrix": transition,
     }
     return data
 

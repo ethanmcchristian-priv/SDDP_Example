@@ -260,11 +260,32 @@ Resolved for v1:
       expensive fuel (a built-in coupled assumption that moves water values).
 - [x] Cascade: field `downstream` present but `null` in v1 (deferred to a variant).
 
-Still open (Phase 2):
-- [ ] Language/solver: **Python + HiGHS/PuLP** (recommended for transparency) vs `SDDP.jl`.
+Resolved for Phase 2:
+- [x] Language/solver: **Python + PuLP**, solved in-process with **HiGHS** (open source),
+      falling back to bundled **CBC**. Install: `pip install pulp highspy`.
+- [x] Two uncertainty modes in **one engine**: stagewise-**independent** and
+      stagewise-**dependent (Markov)** with an exogenous non-uniform transition matrix.
+      Independent is the special case where every transition row equals the marginal
+      scenario probabilities, so the same code serves both.
 
 ## 9. Status
 - **Phase 1 — DONE.** `src/make_inputs.py` generates `data/inputs_v1.json`;
-  `src/data_io.py` loads, validates, and prints a sanity report. Run
-  `python src/data_io.py` to confirm.
-- **Phase 2 — next.** Implement the baseline SDDP solver against `inputs_v1`.
+  `src/data_io.py` loads, validates, and prints a sanity report.
+- **Phase 2 — DONE.** `src/sddp.py` trains both models and reports water values.
+  Both converge (LB ≈ simulated cost, gap < 1%). Headline finding already visible:
+  the Markov model assigns **systematically higher** water values than the independent
+  model on the *same* physical system, because persistent droughts make storage more
+  valuable — concrete proof that the water value reflects the assumed future, not a
+  physical constant. Results written to `results/water_values.csv` + `summary.json`.
+- **Phase 3 — next.** Turn the one-off variants into a sweep (see §6): inflow
+  dry/wet/variance, discount rate, risk aversion (CVaR), end-of-horizon value,
+  thermal cost level, scenario count, cascade — each as a comparison table vs baseline.
+
+### How the engine works (one paragraph)
+Each stage is an LP that fixes incoming storage with `storage_start[h] == x[h]`; the
+dual of that constraint is the **water value** (cost saved per extra MWh stored). The
+future-cost function is built from **Benders cuts** added in a backward pass; a forward
+pass (several sampled paths per iteration) supplies the trial storage states. For the
+Markov model each cut is a transition-probability-weighted combination of the successor
+states' subproblem values. Convergence is tracked by an expected first-stage **lower
+bound** vs a Monte-Carlo **upper bound**.

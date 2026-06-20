@@ -21,7 +21,15 @@ cheap fuel), carrying both an inflow profile and a thermal variable-cost profile
 data/inputs_v1.json   canonical input file (generated, version-controlled)
 src/make_inputs.py     deterministic generator for inputs_v1.json (edit the dials here)
 src/data_io.py         load + validate + sanity report (the Phase 1 acceptance test)
+src/sddp.py            the LP-based SDDP engine (independent + Markov modes)
+results/               generated water-value tables (gitignored)
 PLAN.md                project plan and variant catalog
+```
+
+## Install
+
+```bash
+pip install pulp highspy   # PuLP modeling + in-process HiGHS solver (open source)
 ```
 
 ## Usage
@@ -29,7 +37,14 @@ PLAN.md                project plan and variant catalog
 ```bash
 python src/make_inputs.py     # (re)generate data/inputs_v1.json
 python src/data_io.py         # validate and print the sanity report
+python src/sddp.py            # train both SDDP models and print the water-value comparison
 ```
+
+`sddp.py` trains a **stagewise-independent** model and a **stagewise-dependent (Markov)**
+model on the same physical system and prints their water values side by side. The Markov
+model uses the exogenous, non-uniform transition matrix in the input file (drought
+persistence), which raises water values — the first concrete demonstration that the water
+value depends on the assumed future, not just the physics.
 
 The input data is hand-crafted synthetic data produced by a pure formula (no RNG), so
 every number is reproducible and reason-about-able. Tweak the dials at the top of
@@ -39,4 +54,7 @@ to change the example.
 ## Status
 
 - **Phase 1 — done:** input file + loader/validator/sanity report.
-- **Phase 2 — next:** the baseline SDDP solver.
+- **Phase 2 — done:** LP-based SDDP engine with stagewise-independent and Markov modes;
+  both converge and produce comparable water values that differ by assumption.
+- **Phase 3 — next:** sweep the remaining assumption levers (risk aversion, discount,
+  end-of-horizon value, inflow shifts, scenario count, cascade) — see PLAN.md §6.

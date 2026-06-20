@@ -249,8 +249,22 @@ that proves the thesis: "no correct water value — it's assumptions all the way
 3. **Phase 3** — implement variant switches, run the catalog, build the comparison report.
 4. Write `README.md` with the headline finding and how to reproduce.
 
-## 8. Open decisions (resolve at start of Phase 1)
-- [ ] File format: **JSON** or **YAML**? (lean JSON for tooling, YAML for comments)
-- [ ] Units: model in **energy (MWh)** throughout, or **water volume** + production factor?
+## 8. Open decisions
+
+Resolved for v1:
+- [x] File format: **JSON** (`data/inputs_v1.json`).
+- [x] Units: **energy (MWh)** throughout; stored water in MWh, `production_factor = 1.0`.
+- [x] Scenarios: **10**, each a coherent state of the world carrying both an inflow
+      profile (per plant, per stage) **and** a thermal variable cost (per stage).
+- [x] Thermal cost varies by **scenario AND stage**; correlated so dry scenarios have
+      expensive fuel (a built-in coupled assumption that moves water values).
+- [x] Cascade: field `downstream` present but `null` in v1 (deferred to a variant).
+
+Still open (Phase 2):
 - [ ] Language/solver: **Python + HiGHS/PuLP** (recommended for transparency) vs `SDDP.jl`.
-- [ ] Cascade in v1 inputs or defer to a variant? (recommend: include the *field*, leave null)
+
+## 9. Status
+- **Phase 1 — DONE.** `src/make_inputs.py` generates `data/inputs_v1.json`;
+  `src/data_io.py` loads, validates, and prints a sanity report. Run
+  `python src/data_io.py` to confirm.
+- **Phase 2 — next.** Implement the baseline SDDP solver against `inputs_v1`.

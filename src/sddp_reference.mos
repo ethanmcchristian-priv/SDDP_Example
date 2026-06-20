@@ -1,0 +1,325 @@
+(!******************************************************************************
+  sddp_reference.mos  --  FICO Xpress Mosel reference translation of src/sddp.py
+
+  PURPOSE: a readable, side-by-side reference so the SDDP / LP formulation can be
+  checked in Mosel rather than Python. This is NOT meant to be run as-is (data
+  loading is stubbed, and in production you'd manage the repeated re-solves with
+  mpproblem/reset). Every section is annotated with the Python it mirrors.
+
+  Same algorithm, two uncertainty modes:
+     USE_MARKOV = false  -> stagewise-INDEPENDENT (redraw from marginal probs)
+     USE_MARKOV = true   -> stagewise-DEPENDENT  (exogenous transition matrix)
+  The independent case is the special case where every transition row equals the
+  marginal scenario probabilities, so one engine serves both.
+
+  WATER VALUE: each stage LP pins incoming storage with  s0(h) = x(h)  (ctr Fix).
+  getdual(Fix(h)) = d(cost)/d(x(h)) <= 0; the reported water value is -getdual,
+  i.e. the cost saved per extra MWh stored.
+******************************************************************************!)
+
+model "Small SDDP (reference)"
+  uses "mmxprs", "mmsystem"
+
+  parameters
+    NT = 10            ! stages  (weeks)
+    NS = 10            ! scenarios / Markov states
+    DISCOUNT = 0.0     ! per-stage discount rate
+    USE_MARKOV = false
+    ITERS    = 40
+    NPATHS   = 5       ! forward paths per iteration
+    NSIM     = 500     ! simulation sample size for the upper bound
+  end-parameters
+
+  declarations
+    STAGES    = 1..NT
+    SCN       = 1..NS
+    PLANTS:     set of string
+
+    ! ---- physical system (mirrors data["hydro"], ["thermal"], ["demand"]) ----
+    maxstor:    dynamic array(PLANTS) of real     ! max_storage_MWh
+    minstor:    dynamic array(PLANTS) of real     ! min_storage_MWh
+    initstor:   dynamic array(PLANTS) of real     ! initial_storage_MWh
+    maxturb:    dynamic array(PLANTS) of real     ! max_turbine_MWh_per_stage
+    prodfac:    dynamic array(PLANTS) of real     ! production_factor (1.0 here)
+
+    demand:     array(STAGES) of real             ! load_MWh_per_stage
+    voll:       real                              ! unserved_energy_cost_per_MWh
+    tcap:       real                              ! thermal capacity_MWh_per_stage
+
+    ! ---- uncertainty (mirrors data["uncertainty"]) ----
+    inflow:     dynamic array(PLANTS, STAGES, SCN) of real   ! inflows_MWh[h][t][m]
+    tcost:      array(STAGES, SCN) of real                   ! thermal_cost[t][m]
+    margprob:   array(SCN) of real                ! scenario_probabilities
+    Pmat:       array(SCN, SCN) of real           ! markov transition_matrix
+    initdist:   array(SCN) of real                ! markov initial_distribution
+
+    df:         real                              ! one-stage discount factor
+  end-declarations
+
+  df := 1.0 / (1.0 + DISCOUNT)
+
+  (! ----------------------------------------------------------------------------
+     DATA LOADING (stub).  In the Python this is data_io.load(inputs_v1.json).
+     Here you would populate the arrays above, e.g. with `initializations from`.
+     PLANTS := {"H1","H2","H3","H4","H5"}; etc.
+     If USE_MARKOV = false, set Pmat(m,n) := margprob(n) and initdist := margprob,
+     which makes every transition row identical -> memoryless.
+  ---------------------------------------------------------------------------- !)
+
+  ! ============================================================================
+  ! CUT POOL.  cuts[t][m] in Python -> these dynamic arrays, indexed by a counter.
+  !   theta >= cut_intercept(t,m,k) + sum_h cut_slope(t,m,k,h) * s1(h)
+  !
+  ! NOTE THE (t, m) INDEXING -- IT IS WHAT MAKES THE MARKOV MODEL CORRECT.
+  ! There is one value function PER (stage, Markov state): V_t^m(x). The cuts for
+  ! V_t^m live in cut_*(t, m, .) and must be solved together with that state's own
+  ! data inflow(.,t,m) / tcost(t,m). "Matching on inflow regime" is enforced by:
+  !   1. this per-(t,m) cut pool,
+  !   2. each successor solve_subproblem(t+1, n, .) using regime-n data + cuts, and
+  !   3. the parent weighting successors by its OWN transition row Pmat(m,.).
+  ! With those in place the aggregated single-cut algebra is valid for BOTH modes.
+  !
+  ! INDEPENDENT vs MARKOV: when USE_MARKOV = false the transition row equals the
+  ! marginal probs for every m, so the cut built for each m is identical and the
+  ! pools collapse to one value function per stage -- the per-(t,m) structure is
+  ! redundant but harmless. When USE_MARKOV = true the rows differ and each regime
+  ! genuinely needs its own V_t^m. Do NOT drop the m index to "simplify": that
+  ! would apply dry-successor cuts to wet parents and silently revert Markov to
+  ! the independent policy.
+  ! ============================================================================
+  declarations
+    ncuts:         array(STAGES, SCN) of integer
+    cut_intercept: dynamic array(STAGES, SCN, range) of real
+    cut_slope:     dynamic array(STAGES, SCN, range, PLANTS) of real
+  end-declarations
+
+  ! ============================================================================
+  ! OUTPUTS of the stage subproblem (Mosel procs don't return tuples, so we use
+  ! module-global result holders, written by solve_subproblem).
+  ! ============================================================================
+  declarations
+    sp_obj:        real                       ! full objective (incl. df*theta)
+    sp_immediate:  real                       ! immediate cost only (for the UB)
+    sp_storage_end: dynamic array(PLANTS) of real   ! storage leaving the stage
+    sp_fixdual:    dynamic array(PLANTS) of real     ! getdual(Fix(h))  (<= 0)
+  end-declarations
+
+  ! ----------------------------------------------------------------------------
+  ! THE STAGE SUBPROBLEM  (mirrors SDDP.subproblem in sddp.py)
+  ! Solve stage t in state m with incoming storage x(.). Writes sp_* globals.
+  ! ----------------------------------------------------------------------------
+  procedure solve_subproblem(t: integer, m: integer, x: array(PLANTS) of real)
+    declarations
+      s0, s1, rel, spl: dynamic array(PLANTS) of mpvar   ! storage in/out, release, spill
+      gen, uns, theta:  mpvar                            ! thermal, unserved, future cost
+      Fix:   dynamic array(PLANTS) of linctr             ! incoming-storage fixing ctrs
+      WB:    dynamic array(PLANTS) of linctr             ! water balance
+      CutC:  dynamic array(range)  of linctr             ! Benders cuts on the future
+      Demand: linctr
+      Obj:    linctr
+    end-declarations
+
+    ! --- variable bounds (mpvar are >= 0 by default) ---
+    forall(h in PLANTS) do
+      create(s0(h)); create(s1(h)); create(rel(h)); create(spl(h))
+      setlb(s1(h), minstor(h));  setub(s1(h), maxstor(h))   ! min <= storage_end <= max
+      setub(rel(h), maxturb(h))                             ! 0 <= release <= max_turbine
+    end-do
+    setub(gen, tcap)                                        ! 0 <= thermal <= capacity
+    ! uns >= 0, spl >= 0, theta >= 0 (>= end-of-horizon value, which is 0) by default
+
+    ! --- fixing constraints: their duals are the incoming water values ---
+    forall(h in PLANTS)
+      Fix(h) := s0(h) = x(h)
+
+    ! --- water balance (no cascade in v1): s1 = s0 + inflow - release - spill ---
+    forall(h in PLANTS)
+      WB(h) := s1(h) = s0(h) + inflow(h, t, m) - rel(h) - spl(h)
+
+    ! --- demand balance: hydro energy + thermal + unserved = load ---
+    Demand := sum(h in PLANTS) prodfac(h)*rel(h) + gen + uns = demand(t)
+
+    ! --- future-cost cuts (only present once the backward pass has added them) ---
+    forall(k in 1..ncuts(t, m))
+      CutC(k) := theta >= cut_intercept(t, m, k)
+                          + sum(h in PLANTS) cut_slope(t, m, k, h) * s1(h)
+
+    ! --- objective: immediate variable cost + discounted future cost ---
+    Obj := tcost(t, m)*gen + voll*uns + df*theta
+    minimize(Obj)
+
+    ! --- harvest results into the global holders ---
+    sp_obj := getobjval
+    sp_immediate := tcost(t, m)*getsol(gen) + voll*getsol(uns)
+    forall(h in PLANTS) do
+      sp_storage_end(h) := getsol(s1(h))
+      sp_fixdual(h)     := getdual(Fix(h))     ! d(obj)/d(x(h)); water value = -this
+    end-do
+  end-procedure
+
+  ! ----------------------------------------------------------------------------
+  ! SAMPLING HELPERS (mirrors sample_initial / sample_next)
+  ! ----------------------------------------------------------------------------
+  function sample_index(probs: array(SCN) of real): integer
+    declarations
+      u, c: real
+    end-declarations
+    u := random            ! uniform [0,1)
+    c := 0.0
+    returned := NS         ! fallback = last state
+    forall(n in SCN) do
+      c := c + probs(n)
+      if u < c then
+        returned := n
+        break
+      end-if
+    end-do
+  end-function
+
+  ! transition row for state m (independent mode = marginal probs, ignores m)
+  function trans_row(m: integer): array(SCN) of real
+    if USE_MARKOV then
+      forall(n in SCN) returned(n) := Pmat(m, n)
+    else
+      forall(n in SCN) returned(n) := margprob(n)
+    end-if
+  end-function
+
+  ! ----------------------------------------------------------------------------
+  ! FORWARD PASS (mirrors SDDP.forward): one simulated path. Records the per-stage
+  ! end-of-stage storage as trial points; returns the discounted immediate cost.
+  ! ----------------------------------------------------------------------------
+  declarations
+    trial_storage: array(STAGES, PLANTS) of real   ! trial[t][h] from the forward pass
+  end-declarations
+
+  function forward_pass: real
+    declarations
+      x:    array(PLANTS) of real
+      m:    integer
+      cost: real
+    end-declarations
+    forall(h in PLANTS) x(h) := initstor(h)
+    m := sample_index(initdist)
+    cost := 0.0
+    forall(t in STAGES) do
+      solve_subproblem(t, m, x)
+      cost := cost + df^(t-1) * sp_immediate
+      forall(h in PLANTS) do
+        trial_storage(t, h) := sp_storage_end(h)
+        x(h) := sp_storage_end(h)
+      end-do
+      if t < NT then
+        m := sample_index(trans_row(m))
+      end-if
+    end-do
+    returned := cost
+  end-function
+
+  ! ----------------------------------------------------------------------------
+  ! BACKWARD PASS (mirrors SDDP.backward). For stage t the cut approximates the
+  ! expected value of being at end-of-stage-t storage y = trial[t], evaluated via
+  ! the successor subproblems at stage t+1. A P(m,.)-weighted cut is added to
+  ! every node (t, m). The last stage (t = NT) keeps theta = 0 (end value), so it
+  ! never receives cuts; we build cuts for t = NT-1 down to 1.
+  ! ----------------------------------------------------------------------------
+  procedure backward_pass
+    declarations
+      y:     array(PLANTS) of real
+      Q:     array(SCN) of real                  ! successor objective values
+      g:     array(SCN, PLANTS) of real          ! successor fix-duals = cut gradients
+      k, t:  integer
+      slope: real
+      intercept: real
+    end-declarations
+
+    ! Mosel ranges are increasing, so we sweep i=1..NT-1 and remap t := NT-i to go
+    ! DOWN the horizon. Order matters: stage t+1 must already be updated before t.
+    forall(i in 1..NT-1) do
+      t := NT - i                                ! t = NT-1, NT-2, ..., 1
+      forall(h in PLANTS) y(h) := trial_storage(t, h)
+
+      ! Solve every successor state once at the trial point. solve_subproblem(t+1,n,.)
+      ! reads inflow(.,t+1,n), tcost(t+1,n) and cut_*(t+1,n,.) -- the value function
+      ! V_{t+1}^n specific to regime n (regime-matching point 2 above).
+      forall(n in SCN) do
+        solve_subproblem(t+1, n, y)
+        Q(n) := sp_obj
+        forall(h in PLANTS) g(n, h) := sp_fixdual(h)
+      end-do
+
+      ! Build a transition-probability-weighted cut for each node (t, m) using that
+      ! parent's OWN row (point 3). Markov: rows differ -> a different cut per m.
+      ! Independent: rows identical -> same cut for every m (one value function).
+      forall(mm in SCN) do
+        k := ncuts(t, mm) + 1
+        ! slope(h) = sum_n P(mm,n) * g(n,h)
+        forall(h in PLANTS) do
+          slope := sum(n in SCN) (if USE_MARKOV then Pmat(mm,n) else margprob(n) end-if) * g(n, h)
+          cut_slope(t, mm, k, h) := slope
+        end-do
+        ! intercept = sum_n P(mm,n) * ( Q(n) - sum_h g(n,h)*y(h) )
+        intercept := sum(n in SCN)
+            (if USE_MARKOV then Pmat(mm,n) else margprob(n) end-if) *
+            (Q(n) - sum(h in PLANTS) g(n, h)*y(h))
+        cut_intercept(t, mm, k) := intercept
+        ncuts(t, mm) := k
+      end-do
+    end-do
+  end-procedure
+
+  ! ----------------------------------------------------------------------------
+  ! LOWER BOUND (mirrors SDDP.lower_bound): expected first-stage value over the
+  ! initial distribution, using the current cuts. A valid lower bound on E[cost].
+  ! ----------------------------------------------------------------------------
+  function lower_bound: real
+    declarations
+      x:  array(PLANTS) of real
+      lb: real
+    end-declarations
+    forall(h in PLANTS) x(h) := initstor(h)
+    lb := 0.0
+    forall(m in SCN | initdist(m) > 0) do
+      solve_subproblem(1, m, x)
+      lb := lb + initdist(m) * sp_obj
+    end-do
+    returned := lb
+  end-function
+
+  ! ----------------------------------------------------------------------------
+  ! TRAINING LOOP (mirrors SDDP.train): NPATHS forward passes + a backward pass
+  ! per iteration, then recompute the lower bound.
+  ! ----------------------------------------------------------------------------
+  procedure train
+    declarations
+      lb, prev: real
+      stable:   integer
+      dummy:    real
+    end-declarations
+    forall(t in STAGES, m in SCN) ncuts(t, m) := 0
+    stable := 0; prev := 0.0
+    forall(it in 1..ITERS) do
+      forall(p in 1..NPATHS) do
+        dummy := forward_pass
+        backward_pass
+      end-do
+      lb := lower_bound
+      writeln("  iter ", it, "   lower bound = ", lb)
+      if prev > 0 and abs(lb - prev)/abs(prev) < 1e-3 then
+        stable := stable + 1
+        if stable >= 5 then break; end-if
+      else
+        stable := 0
+      end-if
+      prev := lb
+    end-do
+  end-procedure
+
+  ! ============================================================================
+  ! MAIN
+  ! ============================================================================
+  ! load_data            ! populate the arrays above from inputs_v1.json
+  train
+  ! Water value at any (t, m, x): solve_subproblem(t, m, x) then read -sp_fixdual(h).
+
+end-model

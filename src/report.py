@@ -46,7 +46,7 @@ def simulate_fixed(model, scenario_idx):
     wv = []
 
     for t in range(model.T):
-        _, _, s_end, fix_dual = model.subproblem(t, scenario_idx, x)
+        _, _, s_end, fix_dual, _ = model.subproblem(t, scenario_idx, x)
         wv.append({h: -fix_dual[h] for h in model.plants})
         stor.append(s_end)    # storage leaving stage t (entering t+1)
         x = s_end

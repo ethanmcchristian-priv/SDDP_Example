@@ -211,8 +211,14 @@ class SDDP:
     def subproblem(self, t, m, x):
         """Solve stage t in state m with incoming storage dict x.
 
-        Returns (total_obj, immediate_cost, storage_end, fix_dual) where
-        fix_dual[h] = d(total_obj)/d(x[h])  (<= 0; more water -> lower cost).
+        Returns (total_obj, immediate_cost, storage_end, fix_dual, decisions):
+          fix_dual[h] = d(total_obj)/d(x[h])  (<= 0; more water -> lower cost)
+          decisions   = {"price": dual of demand constraint = system marginal
+                                  cost ($/MWh) = competitive spot price,
+                         "hydro_gen": {h: MWh dispatched from plant h},
+                         "thermal_gen": MWh, "unserved": MWh}
+        The training/simulation loops only need the first four returns and
+        ignore decisions; revenue/post-hoc analyses use it.
         """
         prob = pulp.LpProblem(f"sp_t{t}_m{m}", pulp.LpMinimize)
 
@@ -261,7 +267,14 @@ class SDDP:
         storage_end = {h: s1[h].value() for h in self.plants}
         fix_dual = {h: fix[h].pi for h in self.plants}
         immediate_val = self.tcost[t][m] * gen.value() + self.voll * uns.value()
-        return pulp.value(prob.objective), immediate_val, storage_end, fix_dual
+        decisions = {
+            "price": prob.constraints["demand"].pi,
+            "hydro_gen": {h: self.hydro[h]["production_factor_MWh_per_MWh"] * rel[h].value()
+                          for h in self.plants},
+            "thermal_gen": gen.value(),
+            "unserved": uns.value(),
+        }
+        return pulp.value(prob.objective), immediate_val, storage_end, fix_dual, decisions
 
     # ---- one training iteration ------------------------------------------
     def forward(self):
@@ -272,7 +285,7 @@ class SDDP:
         trial = []
         cost = 0.0
         for t in range(self.T):
-            obj, immediate, s_end, _ = self.subproblem(t, m, x)
+            obj, immediate, s_end, _, _ = self.subproblem(t, m, x)
             cost += (self.df ** t) * immediate
             trial.append(s_end)
             x = s_end
@@ -299,7 +312,7 @@ class SDDP:
             # value function V_{t+1}^n specific to regime n (point 2 above).
             Q, g = {}, {}
             for n in range(self.S):
-                obj_n, _, _, fix_n = self.subproblem(t + 1, n, y)
+                obj_n, _, _, fix_n, _ = self.subproblem(t + 1, n, y)
                 Q[n] = obj_n
                 g[n] = fix_n  # d(obj_n)/d(incoming storage) = cut gradient
             # Build a P[m][.]-weighted cut for each node (t, m) (point 3 above):
@@ -320,7 +333,7 @@ class SDDP:
         for m in range(self.S):
             if self.initial[m] == 0:
                 continue
-            obj, _, _, _ = self.subproblem(0, m, self.x0)
+            obj, _, _, _, _ = self.subproblem(0, m, self.x0)
             lb += self.initial[m] * obj
         return lb
 
@@ -363,7 +376,7 @@ class SDDP:
             m = rng.choices(range(self.S), weights=self.initial, k=1)[0]
             cost = 0.0
             for t in range(self.T):
-                _, immediate, s_end, fix_dual = self.subproblem(t, m, x)
+                _, immediate, s_end, fix_dual, _ = self.subproblem(t, m, x)
                 cost += (self.df ** t) * immediate
                 for h in self.plants:
                     wv_sum[t][h] += -fix_dual[h]   # cost saved per extra stored MWh

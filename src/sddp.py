@@ -90,6 +90,31 @@ class SDDP:
         # Cut pool: cuts[t][m] is a list of Cut. theta at the LAST stage approximates
         # the end-of-horizon value, which is 0 here (a structural assumption, the
         # V-ENDVALUE lever in PLAN.md), so the last stage never gets cuts.
+        #
+        # WHY THE CUT POOL IS INDEXED BY (t, m) AND NOT JUST t -- READ BEFORE EDITING.
+        # This is what makes the Markov model correct, and it is the one place a
+        # well-meaning "simplification" silently breaks it. There is one value
+        # function PER (stage, Markov state): V_t^m(x). cuts[t][m] are the Benders
+        # cuts for V_t^m, and subproblem(t, m) must read cuts[t][m] together with
+        # that state's own data inflow[h][t][m] / tcost[t][m]. The three things that
+        # together enforce "matching on inflow regime" are:
+        #   1. this per-(t,m) cut pool (regime n is evaluated against V^n, not a
+        #      shared value function),
+        #   2. each successor subproblem(t+1, n, .) using regime-n data + cuts, and
+        #   3. the parent weighting successors by ITS OWN transition row P[m]
+        #      (see backward()).
+        # The aggregated single-cut algebra is then valid for BOTH modes -- the cut
+        # is a P[m]-weighted combination of the successors' tangents.
+        #
+        # INDEPENDENT vs MARKOV: in the independent mode every transition row equals
+        # the marginal probabilities (P[m] == p for all m, set above), so the cut
+        # built for each m is IDENTICAL -> all S pools at a stage hold the same cuts,
+        # i.e. it collapses to a single value function per stage. The per-(t,m)
+        # structure is therefore harmless (just redundant) in the independent case
+        # but ESSENTIAL in the Markov case, where the rows differ and each regime
+        # genuinely needs its own V_t^m. Do NOT collapse cuts to cuts[t] for "speed":
+        # it would apply dry-successor cuts to wet parents and quietly turn the
+        # Markov policy back into the independent one.
         self.cuts = [[[] for _ in range(self.S)] for _ in range(self.T)]
         self.lb_history = []
 
@@ -176,16 +201,28 @@ class SDDP:
     def backward(self, trial):
         """Add cuts. At stage t the cut approximates the expected value of being
         at end-of-stage-t storage y = trial[t], evaluated via the successor
-        subproblems at stage t+1. Cuts are added to every node (t, m)."""
+        subproblems at stage t+1. Cuts are added to every node (t, m).
+
+        Regime matching (see the cut-pool comment in __init__) is enforced here by
+        points 2 and 3: each successor is solved with its own regime-n data and cut
+        pool, and each parent node (t, m) weights those successors by its OWN
+        transition row P[m]. In the Markov case the rows differ so each m gets a
+        genuinely different cut; in the independent case the rows are identical so
+        all m get the same cut (one effective value function per stage).
+        """
         for t in range(self.T - 2, -1, -1):
             y = trial[t]
-            # Solve every successor state once at the trial point.
+            # Solve every successor state once at the trial point. subproblem(t+1, n)
+            # reads inflow[.][t+1][n], tcost[t+1][n] and cuts[t+1][n] -- i.e. the
+            # value function V_{t+1}^n specific to regime n (point 2 above).
             Q, g = {}, {}
             for n in range(self.S):
                 obj_n, _, _, fix_n = self.subproblem(t + 1, n, y)
                 Q[n] = obj_n
                 g[n] = fix_n  # d(obj_n)/d(incoming storage) = cut gradient
-            # Build a P[m][.]-weighted cut for each node (t, m).
+            # Build a P[m][.]-weighted cut for each node (t, m) (point 3 above):
+            # theta_(t,m) >= sum_n P[m][n] * [ Q_n + g_n . (s1 - y) ], a valid cut
+            # because each bracket is a tangent of the convex V_{t+1}^n at y.
             for mm in range(self.S):
                 w = self.P[mm]
                 slope = {h: sum(w[n] * g[n][h] for n in range(self.S))

@@ -54,9 +54,18 @@ class Cut:
 
 
 class SDDP:
-    def __init__(self, data, mode):
+    def __init__(self, data, mode, active_scenarios=None, end_value_points=None):
+        """active_scenarios: optional list of scenario indices the model is allowed
+        to believe in (independent mode only). The marginal probabilities are
+        restricted to those scenarios and renormalized; excluded scenarios get
+        probability 0, so they are never sampled (forward) and contribute nothing
+        to the expectation (backward). This is how the "pessimistic, dry-only"
+        model is built -- same physics, a deliberately truncated view of the
+        future. Ignored for the Markov mode."""
         assert mode in ("independent", "markov")
         self.mode = mode
+        self.active_scenarios = active_scenarios
+        self.end_value_points = None  # set near the end of __init__
         u = data["uncertainty"]
         self.T = data["meta"]["stages"]
         self.S = data["meta"]["scenarios"]
@@ -79,13 +88,22 @@ class SDDP:
 
         # Transition / initial distribution per mode
         if mode == "markov":
+            if active_scenarios is not None:
+                raise ValueError("active_scenarios only applies to independent mode")
             mk = u["markov"]
             self.initial = mk["initial_distribution"]
             self.P = mk["transition_matrix"]
         else:
             p = u["scenario_probabilities"]
-            self.initial = list(p)
-            self.P = [list(p) for _ in range(self.S)]  # rows all equal -> memoryless
+            if active_scenarios is None:
+                w = list(p)
+            else:
+                active = set(active_scenarios)
+                masked = [p[i] if i in active else 0.0 for i in range(self.S)]
+                tot = sum(masked)
+                w = [x / tot for x in masked]   # renormalize over believed scenarios
+            self.initial = w
+            self.P = [list(w) for _ in range(self.S)]  # rows all equal -> memoryless
 
         # Cut pool: cuts[t][m] is a list of Cut. theta at the LAST stage approximates
         # the end-of-horizon value, which is 0 here (a structural assumption, the
@@ -117,6 +135,70 @@ class SDDP:
         # Markov policy back into the independent one.
         self.cuts = [[[] for _ in range(self.S)] for _ in range(self.T)]
         self.lb_history = []
+
+        # End-of-horizon value (the V-ENDVALUE lever). Default None = zero salvage
+        # value (theta >= 0 at the last stage), so water values collapse to 0 near
+        # the end. If given as (mv_at_min, mv_at_init, mv_at_max), we install a
+        # salvage cost on the final storage; see _install_end_value.
+        self.end_value_points = end_value_points
+        if end_value_points is not None:
+            self._install_end_value(end_value_points)
+
+    def _install_end_value(self, points, n_breaks=21):
+        """Install an end-of-horizon salvage value as cuts on the last stage.
+
+        `points` = (mv_min, mv_init, mv_max): the MARGINAL water value ($/MWh) at
+        each plant's min-storage, initial-storage, and max-storage levels, linearly
+        interpolated. Because the marginal is decreasing, the integrated salvage
+        COST EC_h(s) = integral_s^Umax mv_h(u) du is convex and decreasing -- exactly
+        what a set of Benders cuts represents. The value function is separable across
+        plants, so a joint cut is the sum of per-plant tangents; we add one cut per
+        fill-fraction level along the [min..max] diagonal.
+
+        These cuts sit in cuts[T-1][m] for all m (the salvage value is deterministic)
+        and, because the backward pass only writes stages < T-1, they persist and
+        propagate back through the whole recursion, lifting water values everywhere.
+        NOTE: with a non-zero discount rate the objective applies df to theta, so the
+        salvage value would be discounted one extra stage; here discount = 0 (df = 1).
+        """
+        mv_min, mv_init, mv_max = points
+        bounds = {h: (self.hydro[h]["min_storage_MWh"],
+                      self.hydro[h]["initial_storage_MWh"],
+                      self.hydro[h]["max_storage_MWh"]) for h in self.plants}
+
+        def mv(h, s):
+            L, I, U = bounds[h]
+            if s <= L:
+                return mv_min
+            if s >= U:
+                return mv_max
+            if s <= I:
+                return mv_min + (mv_init - mv_min) * (s - L) / (I - L)
+            return mv_init + (mv_max - mv_init) * (s - I) / (U - I)
+
+        def EC(h, p):   # salvage cost = area under mv from p up to full
+            L, I, U = bounds[h]
+            p = max(L, min(U, p))
+            if p >= I:
+                return 0.5 * (mv(h, p) + mv_max) * (U - p)
+            area_low = 0.5 * (mv(h, p) + mv_init) * (I - p)
+            area_high = 0.5 * (mv_init + mv_max) * (U - I)
+            return area_low + area_high
+
+        cuts = []
+        for k in range(n_breaks):
+            lam = k / (n_breaks - 1)                    # fill fraction min..max
+            slope, intercept = {}, 0.0
+            for h in self.plants:
+                L, I, U = bounds[h]
+                p = L + lam * (U - L)                    # this plant's storage at lam
+                m_hp = mv(h, p)
+                slope[h] = -m_hp                         # EC'(p) = -mv(p)
+                intercept += EC(h, p) + m_hp * p         # tangent of EC_h at p
+            cuts.append(Cut(intercept, slope))
+
+        for m in range(self.S):
+            self.cuts[self.T - 1][m] = list(cuts)
 
     # ---- sampling helpers -------------------------------------------------
     def sample_initial(self):
@@ -296,8 +378,8 @@ class SDDP:
         return exp_cost, water_value
 
 
-def _fmt_wv_table(model, water_value):
-    lines = [f"  WATER VALUES ($/MWh stored) -- {model.mode} model"]
+def _fmt_wv_table(label, model, water_value):
+    lines = [f"  WATER VALUES ($/MWh stored) -- {label} model"]
     header = "    stage  " + "".join(f"{h:>8}" for h in model.plants)
     lines.append(header)
     for t in range(model.T):
@@ -306,20 +388,20 @@ def _fmt_wv_table(model, water_value):
     return "\n".join(lines)
 
 
-def run_model(data, mode, iters):
-    print(f"\n=== Training {mode} SDDP ({SOLVER_NAME}) ===")
-    m = SDDP(data, mode)
+def run_model(data, label, iters, **sddp_kwargs):
+    print(f"\n=== Training {label} SDDP ({SOLVER_NAME}) ===")
+    m = SDDP(data, **sddp_kwargs)
     lb = m.train(iters=iters)
     exp_cost, wv = m.simulate(n=500)
     gap = 100 * (exp_cost - lb) / exp_cost if exp_cost else 0.0
     print(f"    lower bound = {lb:.2f}   simulated cost = {exp_cost:.2f}   "
           f"gap = {gap:.1f}% (a few tenths of a % is Monte-Carlo noise)")
-    print(_fmt_wv_table(m, wv))
-    return m, lb, exp_cost, wv
+    print(_fmt_wv_table(label, m, wv))
+    return label, m, lb, exp_cost, wv
 
 
 def write_results(out_dir, results):
-    """results: list of (model, lb, exp_cost, wv). Writes a CSV + JSON."""
+    """results: list of (label, model, lb, exp_cost, wv). Writes a CSV + JSON."""
     import csv
     import json
     os.makedirs(out_dir, exist_ok=True)
@@ -327,19 +409,19 @@ def write_results(out_dir, results):
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["model", "stage", "plant", "water_value_per_MWh"])
-        for m, lb, cost, wv in results:
+        for label, m, lb, cost, wv in results:
             for t in range(m.T):
                 for h in m.plants:
-                    w.writerow([m.mode, t, h, round(wv[t][h], 3)])
+                    w.writerow([label, t, h, round(wv[t][h], 3)])
     summary = {
-        m.mode: {
+        label: {
             "lower_bound": round(lb, 2),
             "expected_cost": round(cost, 2),
             "avg_water_value": {
                 h: round(sum(wv[t][h] for t in range(m.T)) / m.T, 2) for h in m.plants
             },
         }
-        for m, lb, cost, wv in results
+        for label, m, lb, cost, wv in results
     }
     json_path = os.path.join(out_dir, "summary.json")
     with open(json_path, "w", encoding="utf-8") as f:
@@ -352,30 +434,46 @@ def main():
     path = os.path.normpath(os.path.join(here, os.pardir, "data", "inputs_v1.json"))
     data = data_io.validate(data_io.load(path))
 
-    random.seed(12345)
-    ind, ind_lb, ind_cost, ind_wv = run_model(data, "independent", iters=40)
-    random.seed(12345)
-    mkv, mkv_lb, mkv_cost, mkv_wv = run_model(data, "markov", iters=40)
+    # Three models on the SAME physical system, differing only in beliefs:
+    #   independent : all 10 scenarios, no memory
+    #   markov      : all 10, with drought persistence
+    #   dry-only    : a pessimist that believes only the 5 driest scenarios
+    DRY_SCENARIOS = [0, 1, 2, 3, 4]
+    END_VALUE = (1000, 35, 0)   # marginal $/MWh at (min, initial, max) storage
+    specs = [
+        ("independent", dict(mode="independent", end_value_points=END_VALUE)),
+        ("markov", dict(mode="markov", end_value_points=END_VALUE)),
+        ("dry-only", dict(mode="independent", active_scenarios=DRY_SCENARIOS,
+                          end_value_points=END_VALUE)),
+    ]
+    results = []
+    for label, kwargs in specs:
+        random.seed(12345)
+        results.append(run_model(data, label, iters=40, **kwargs))
 
-    # Headline comparison: same physical system, two uncertainty assumptions.
+    # Headline comparison: same physical system, three belief sets.
     print("\n" + "=" * 70)
-    print("  COMPARISON -- same system, different uncertainty assumption")
+    print("  COMPARISON -- same system, different beliefs about the future")
     print("=" * 70)
-    print(f"  expected total cost:  independent = {ind_cost:8.1f}   "
-          f"markov = {mkv_cost:8.1f}")
+    print("  expected total cost (model's own belief):")
+    for label, m, lb, cost, wv in results:
+        print(f"    {label:<14} = {cost:8.1f}")
+    labels = [r[0] for r in results]
     print(f"\n  Average water value over all stages ($/MWh stored):")
-    print(f"    {'plant':<6}{'independent':>14}{'markov':>10}{'  difference':>14}")
-    for h in ind.plants:
-        a = sum(ind_wv[t][h] for t in range(ind.T)) / ind.T
-        b = sum(mkv_wv[t][h] for t in range(mkv.T)) / mkv.T
-        print(f"    {h:<6}{a:>14.1f}{b:>10.1f}{b - a:>14.1f}")
-    print("\n  Same reservoir, same week, different number -- because the water")
-    print("  value reflects the assumed future, not a physical constant.")
+    print("    " + f"{'plant':<6}" + "".join(f"{lab:>14}" for lab in labels))
+    plants = results[0][1].plants
+    for h in plants:
+        cells = ""
+        for label, m, lb, cost, wv in results:
+            avg = sum(wv[t][h] for t in range(m.T)) / m.T
+            cells += f"{avg:>14.1f}"
+        print(f"    {h:<6}{cells}")
+    print("\n  Same reservoir, same week, three different numbers -- because the")
+    print("  water value reflects the assumed future, not a physical constant.")
 
     here = os.path.dirname(os.path.abspath(__file__))
     out_dir = os.path.normpath(os.path.join(here, os.pardir, "results"))
-    write_results(out_dir, [(ind, ind_lb, ind_cost, ind_wv),
-                            (mkv, mkv_lb, mkv_cost, mkv_wv)])
+    write_results(out_dir, results)
 
 
 if __name__ == "__main__":
